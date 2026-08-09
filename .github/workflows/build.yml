@@ -1,0 +1,46 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Restore
+        run: dotnet restore PaneWeaver.csproj
+
+      - name: Build
+        run: dotnet build PaneWeaver.csproj -c Release --no-restore
+
+      - name: Publish self-contained x64 build
+        run: >-
+          dotnet publish PaneWeaver.csproj -c Release -r win-x64
+          --self-contained true
+          -p:PublishSingleFile=true
+          -p:PublishTrimmed=false
+          -p:IncludeNativeLibrariesForSelfExtract=true
+          -o artifacts/PaneWeaver
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PaneWeaver-win-x64
+          path: artifacts/PaneWeaver/
+          if-no-files-found: error

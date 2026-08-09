@@ -1,0 +1,6 @@
+* text=auto
+*.cs text eol=crlf
+*.cmd text eol=crlf
+*.png binary
+*.ico binary
+*.zip binary

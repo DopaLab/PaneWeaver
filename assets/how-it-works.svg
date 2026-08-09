@@ -1,0 +1,49 @@
+<svg width="1000" height="360" viewBox="0 0 1000 360" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1000" y2="360" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#071326"/>
+      <stop offset="1" stop-color="#102A58"/>
+    </linearGradient>
+    <linearGradient id="blue" x1="570" y1="75" x2="900" y2="305" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#14B7FF"/>
+      <stop offset="1" stop-color="#075FD7"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="12" stdDeviation="18" flood-color="#001638" flood-opacity="0.45"/>
+    </filter>
+  </defs>
+  <rect width="1000" height="360" rx="28" fill="url(#bg)"/>
+  <text x="48" y="52" fill="#7BCBFF" font-family="Segoe UI, sans-serif" font-size="17" font-weight="700" letter-spacing="1.5">WITHOUT PANEWEAVER</text>
+  <text x="570" y="52" fill="#7BCBFF" font-family="Segoe UI, sans-serif" font-size="17" font-weight="700" letter-spacing="1.5">WITH PANEWEAVER</text>
+  <g filter="url(#shadow)">
+    <rect x="48" y="82" width="250" height="118" rx="14" fill="#172B49" stroke="#35547B"/>
+    <rect x="66" y="102" width="86" height="24" rx="12" fill="#29496F"/>
+    <text x="79" y="120" fill="#C6DCF4" font-family="Segoe UI, sans-serif" font-size="13">Downloads</text>
+    <path d="M74 151H105L114 160H166V181H74V151Z" fill="#159DFF"/>
+    <rect x="88" y="137" width="250" height="118" rx="14" fill="#172B49" stroke="#35547B"/>
+    <rect x="106" y="157" width="79" height="24" rx="12" fill="#29496F"/>
+    <text x="119" y="175" fill="#C6DCF4" font-family="Segoe UI, sans-serif" font-size="13">Projects</text>
+    <path d="M114 206H145L154 215H206V236H114V206Z" fill="#6978FF"/>
+    <rect x="128" y="192" width="250" height="118" rx="14" fill="#172B49" stroke="#35547B"/>
+    <rect x="146" y="212" width="70" height="24" rx="12" fill="#29496F"/>
+    <text x="159" y="230" fill="#C6DCF4" font-family="Segoe UI, sans-serif" font-size="13">Photos</text>
+    <path d="M154 261H185L194 270H246V291H154V261Z" fill="#13C4DE"/>
+  </g>
+  <path d="M430 180H515" stroke="#44B4FF" stroke-width="5" stroke-linecap="round"/>
+  <path d="M493 158L516 180L493 202" stroke="#44B4FF" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+  <g filter="url(#shadow)">
+    <rect x="570" y="82" width="382" height="228" rx="18" fill="#101F36" stroke="#3B5E87"/>
+    <path d="M570 100C570 90.0589 578.059 82 588 82H934C943.941 82 952 90.0589 952 100V131H570V100Z" fill="#1A3356"/>
+    <rect x="586" y="94" width="104" height="29" rx="9" fill="url(#blue)"/>
+    <rect x="698" y="94" width="104" height="29" rx="9" fill="#29496F"/>
+    <rect x="810" y="94" width="104" height="29" rx="9" fill="#29496F"/>
+    <text x="604" y="114" fill="white" font-family="Segoe UI, sans-serif" font-size="13">Downloads</text>
+    <text x="720" y="114" fill="#C6DCF4" font-family="Segoe UI, sans-serif" font-size="13">Projects</text>
+    <text x="833" y="114" fill="#C6DCF4" font-family="Segoe UI, sans-serif" font-size="13">Photos</text>
+    <rect x="595" y="153" width="332" height="34" rx="10" fill="#1C3558"/>
+    <text x="613" y="176" fill="#9FC4EA" font-family="Segoe UI, sans-serif" font-size="14">Home  ›  Downloads</text>
+    <path d="M609 217H658L672 231H752V279H609V217Z" fill="url(#blue)"/>
+    <text x="773" y="253" fill="#D7E7F8" font-family="Segoe UI, sans-serif" font-size="22" font-weight="600">One native window</text>
+    <text x="774" y="278" fill="#83ACD4" font-family="Segoe UI, sans-serif" font-size="15">Three exact destinations</text>
+  </g>
+</svg>

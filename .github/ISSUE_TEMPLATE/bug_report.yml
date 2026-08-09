@@ -1,0 +1,65 @@
+name: Bug report
+description: Report incorrect routing, flashing, or Explorer behavior
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Thanks for helping improve PaneWeaver. Please include exact Windows details.
+  - type: input
+    id: version
+    attributes:
+      label: PaneWeaver version
+      placeholder: 1.0.0
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version and build
+      description: Run `winver` and copy the version and OS build.
+      placeholder: Windows 11 24H2, OS build 26100.x
+    validations:
+      required: true
+  - type: dropdown
+    id: source
+    attributes:
+      label: How was the folder opened?
+      options:
+        - Win + E
+        - Desktop or Start
+        - Another application
+        - Explorer detached tab
+        - Shortcut
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      placeholder: Tell us exactly what you opened and what happened.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: tools
+    attributes:
+      label: Explorer customization tools
+      description: List tools such as shell replacements, tab utilities, or Windhawk mods, or write None.
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: Native File Explorer tabs work when PaneWeaver is not running.
+          required: true
+        - label: I checked for an existing issue describing this behavior.
+          required: true
