@@ -9,22 +9,40 @@ internal sealed class ExplorerEntry : IDisposable
         Browser = browser;
         Identity = identity;
         Hwnd = hwnd;
-        Path = path;
         GlobalIndex = globalIndex;
     }
 
     internal object Browser { get; }
     internal IntPtr Identity { get; }
     internal IntPtr Hwnd { get; }
-    internal string Path { get; }
+    internal string Path => ExplorerCom.ReadPath((IExplorerBrowser)Browser);
+    internal string FileSystemPath => ExplorerCom.ReadPath((IExplorerBrowser)Browser, virtualFallback: false);
     internal int GlobalIndex { get; }
+
+    internal IntPtr TabHwnd
+    {
+        get
+        {
+            object? service = null;
+            try
+            {
+                var sid = new Guid("4C96BE40-915C-11CF-99D3-00AA004AE837");
+                var iid = new Guid("000214E2-0000-0000-C000-000000000046");
+                ((IComServiceProvider)Browser).QueryService(ref sid, ref iid, out service);
+                ((IOleWindow)service).GetWindow(out var hwnd);
+                return hwnd;
+            }
+            catch { return IntPtr.Zero; }
+            finally { if (service is not null && Marshal.IsComObject(service)) Marshal.ReleaseComObject(service); }
+        }
+    }
 
     internal bool Navigate(string path)
     {
         try
         {
-            dynamic browser = Browser;
-            browser.Navigate2(path);
+            object target = path, missing = Type.Missing;
+            ((IExplorerBrowser)Browser).Navigate2(ref target, ref missing, ref missing, ref missing, ref missing);
             return true;
         }
         catch
@@ -37,8 +55,7 @@ internal sealed class ExplorerEntry : IDisposable
     {
         try
         {
-            dynamic browser = Browser;
-            browser.Quit();
+            ((IExplorerBrowser)Browser).Quit();
         }
         catch
         {
@@ -62,44 +79,49 @@ internal sealed class ExplorerEntry : IDisposable
     }
 }
 
-internal static class ExplorerCom
+internal sealed class ExplorerCom : IDisposable
 {
-    internal static List<ExplorerEntry> Enumerate(IntPtr onlyHwnd = default)
+    private IShellWindows? windows;
+
+    internal int Count
+    {
+        get { try { EnsureConnected(); return windows!.Count; } catch { Dispose(); return -1; } }
+    }
+
+    internal void WarmUp()
+    {
+        try { EnsureConnected(); _ = windows!.Count; }
+        catch { Dispose(); }
+    }
+
+    private void EnsureConnected()
+    {
+        if (windows is not null) return;
+        var type = Type.GetTypeFromCLSID(new Guid("9BA05972-F6A8-11CF-A442-00A0C90A8F39"));
+        windows = (IShellWindows)Activator.CreateInstance(type!)!;
+    }
+
+    internal List<ExplorerEntry> Enumerate(IntPtr onlyHwnd = default, IntPtr onlyTab = default, bool firstOnly = false)
     {
         var results = new List<ExplorerEntry>();
-        object? shell = null;
-        object? windows = null;
         try
         {
-            var type = Type.GetTypeFromProgID("Shell.Application");
-            if (type is null)
-            {
-                return results;
-            }
-
-            shell = Activator.CreateInstance(type);
-            if (shell is null)
-            {
-                return results;
-            }
-
-            dynamic dynamicShell = shell;
-            windows = dynamicShell.Windows();
-            dynamic dynamicWindows = windows;
-            var count = (int)dynamicWindows.Count;
-            for (var i = 0; i < count; i++)
+            EnsureConnected();
+            var count = windows!.Count;
+            // New registrations are usually last; correctness is still verified
+            // by HWND and COM identity, never inferred from collection position.
+            for (var i = count - 1; i >= 0; i--)
             {
                 object? browser = null;
                 try
                 {
-                    browser = dynamicWindows.Item(i);
+                    browser = windows.Item(i);
                     if (browser is null)
                     {
                         continue;
                     }
 
-                    dynamic dynamicBrowser = browser;
-                    var hwnd = new IntPtr(Convert.ToInt64(dynamicBrowser.HWND));
+                    var hwnd = new IntPtr(((IExplorerBrowser)browser).HWND);
                     if (onlyHwnd != IntPtr.Zero && hwnd != onlyHwnd)
                     {
                         Release(browser);
@@ -109,9 +131,13 @@ internal static class ExplorerCom
 
                     var identity = Marshal.GetIUnknownForObject(browser);
                     Marshal.Release(identity);
-                    var path = ReadPath(dynamicBrowser);
-                    results.Add(new ExplorerEntry(browser, identity, hwnd, path, i));
+                    // Paths require extra cross-process calls. Read only the source
+                    // and claimed destination, never every existing tab on each poll.
+                    var entry = new ExplorerEntry(browser, identity, hwnd, string.Empty, i);
                     browser = null;
+                    if (onlyTab != IntPtr.Zero && entry.TabHwnd != onlyTab) { entry.Dispose(); continue; }
+                    results.Add(entry);
+                    if (firstOnly) break;
                 }
                 catch
                 {
@@ -130,69 +156,28 @@ internal static class ExplorerCom
             }
 
             results.Clear();
-        }
-        finally
-        {
-            if (windows is not null)
-            {
-                Release(windows);
-            }
-
-            if (shell is not null)
-            {
-                Release(shell);
-            }
+            Dispose(); // Explorer restarted: reconnect on the next scheduler pass.
         }
 
         return results;
     }
 
-    internal static int Count()
+    public void Dispose()
     {
-        object? shell = null;
-        object? windows = null;
-        try
-        {
-            var type = Type.GetTypeFromProgID("Shell.Application");
-            shell = type is null ? null : Activator.CreateInstance(type);
-            if (shell is null)
-            {
-                return 0;
-            }
-
-            dynamic dynamicShell = shell;
-            windows = dynamicShell.Windows();
-            dynamic dynamicWindows = windows;
-            return (int)dynamicWindows.Count;
-        }
-        catch
-        {
-            return 0;
-        }
-        finally
-        {
-            if (windows is not null)
-            {
-                Release(windows);
-            }
-
-            if (shell is not null)
-            {
-                Release(shell);
-            }
-        }
+        if (windows is not null) Release(windows);
+        windows = null;
     }
 
-    private static string ReadPath(dynamic browser)
+    internal static string ReadPath(IExplorerBrowser browser, bool virtualFallback = true)
     {
         try
         {
-            string url = Convert.ToString(browser.LocationURL) ?? string.Empty;
+            string url = browser.LocationURL ?? string.Empty;
             if (!string.IsNullOrWhiteSpace(url))
             {
                 if (Uri.TryCreate(url, UriKind.Absolute, out Uri? uri) && uri.IsFile)
                 {
-                    return Uri.UnescapeDataString(uri.LocalPath);
+                    return uri.LocalPath; // Already decoded; decoding twice corrupts literal %xx names.
                 }
 
                 return url;
@@ -203,13 +188,25 @@ internal static class ExplorerCom
             // Virtual folders often expose an empty LocationURL.
         }
 
+        if (!virtualFallback) return string.Empty;
+
+        object? document = null, folder = null, item = null;
         try
         {
-            return Convert.ToString(browser.Document.Folder.Self.Path) ?? string.Empty;
+            document = browser.Document;
+            folder = ((dynamic)document).Folder;
+            item = ((dynamic)folder).Self;
+            return Convert.ToString(((dynamic)item).Path) ?? string.Empty;
         }
         catch
         {
             return string.Empty;
+        }
+        finally
+        {
+            if (item is not null) Release(item);
+            if (folder is not null) Release(folder);
+            if (document is not null) Release(document);
         }
     }
 
@@ -227,4 +224,42 @@ internal static class ExplorerCom
             // Best effort.
         }
     }
+}
+
+[ComImport, Guid("6D5140C1-7436-11CE-8034-00AA006009FA"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+internal interface IComServiceProvider
+{
+    void QueryService(ref Guid service, ref Guid iid, [MarshalAs(UnmanagedType.Interface)] out object result);
+}
+
+[ComImport, Guid("00000114-0000-0000-C000-000000000046"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+internal interface IOleWindow
+{
+    void GetWindow(out IntPtr hwnd);
+    void ContextSensitiveHelp([MarshalAs(UnmanagedType.Bool)] bool enter);
+}
+
+// Dispatch interfaces avoid the dynamic binder, GetIDsOfNames and runtime type
+// discovery in the hot path. DISPIDs come from the Windows SDK ExDisp.idl.
+[ComImport, Guid("85CB6900-4D95-11CF-960C-0080C7F4EE85"), InterfaceType(ComInterfaceType.InterfaceIsDual)]
+internal interface IShellWindows
+{
+    int Count { get; }
+    [return: MarshalAs(UnmanagedType.IDispatch)]
+    object Item([In, Optional, MarshalAs(UnmanagedType.Struct)] object index);
+}
+
+[ComImport, Guid("D30C1661-CDAF-11D0-8A3E-00C04FC9E26E"), InterfaceType(ComInterfaceType.InterfaceIsIDispatch)]
+internal interface IExplorerBrowser
+{
+    [DispId(-515)] long HWND { get; }
+    [DispId(211)] string LocationURL { [return: MarshalAs(UnmanagedType.BStr)] get; }
+    [DispId(203)] object Document { [return: MarshalAs(UnmanagedType.IDispatch)] get; }
+    [DispId(300)] void Quit();
+    [DispId(500)]
+    void Navigate2([In, MarshalAs(UnmanagedType.Struct)] ref object target,
+        [In, Optional, MarshalAs(UnmanagedType.Struct)] ref object flags,
+        [In, Optional, MarshalAs(UnmanagedType.Struct)] ref object frame,
+        [In, Optional, MarshalAs(UnmanagedType.Struct)] ref object post,
+        [In, Optional, MarshalAs(UnmanagedType.Struct)] ref object headers);
 }

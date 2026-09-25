@@ -86,13 +86,19 @@ Right-click the tray icon to pause routing, toggle startup, open the activity lo
 PaneWeaver deliberately avoids simulated typing and clipboard tricks.
 
 1. A Windows accessibility event reports a new `CabinetWClass` Explorer window.
-2. PaneWeaver immediately applies a transparent layer and DWM cloak before the window can become distracting.
+2. PaneWeaver hides the new window using DWM cloaking when available, with a reversible transparency fallback.
 3. Explorer's Shell COM object provides the requested folder path.
 4. PaneWeaver invokes Explorer's native internal **new tab** command.
-5. The newly appended Shell COM entry is addressed directly and navigated to the captured path.
-6. After navigation succeeds, the hidden source window closes. If anything fails, it is restored.
+5. The newly created native tab HWND is resolved to its exact Shell browser object and navigated to the captured path.
+6. After the destination is observed and the source is checked again, the hidden source window closes. If confirmation fails, it is restored.
 
-All routing transactions run on one STA broker thread. That serialization—and targeting a specific COM entry—is what prevents fast launches or unrelated browsing from overwriting the wrong tab.
+The broker uses a pumped STA with asynchronous requests. Only native tab creation is serialized; destination readiness and navigation can overlap. It does not use list indexes or the active tab to choose a destination. The Win+E path needs no COM lookup at all.
+
+### Performance, honestly
+
+Version 1.1 targets sub-second interaction. Warm new-tab requests are substantially cheaper than capturing an external Explorer window, which Windows must first create and register. Cold starts, many tabs, burst launches, slow drives, and shell extensions can take longer. There is no universal sub-second or zero-flicker guarantee. See the [measured results and reproducible harness](docs/TESTING.md).
+
+A separate watchdog restores captured windows if routing exceeds its 3-second recovery budget. That is a recovery threshold, **not** a promised completion time. PaneWeaver never closes a source on an unconfirmed transfer.
 
 See [Architecture](docs/ARCHITECTURE.md) for the deeper implementation notes and [Verification](docs/TESTING.md) for live test results.
 

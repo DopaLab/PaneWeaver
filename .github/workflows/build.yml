@@ -29,6 +29,9 @@ jobs:
       - name: Build
         run: dotnet build PaneWeaver.csproj -c Release --no-restore
 
+      - name: Regression checks
+        run: dotnet run --project tests/PaneWeaver.Tests.csproj -c Release
+
       - name: Publish self-contained x64 build
         run: >-
           dotnet publish PaneWeaver.csproj -c Release -r win-x64

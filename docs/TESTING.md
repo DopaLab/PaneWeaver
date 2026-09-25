@@ -1,14 +1,38 @@
-# PaneWeaver verification
+# PaneWeaver 1.1 verification
 
-Tested on Windows 11 Pro 24H2, build 26100, x64.
+Tested locally on Windows 11 x64, build 26100, on September 25, 2026. These are observations from a real desktop session, not a universal latency guarantee.
 
-## Live Explorer checks
+## Final routing run
 
-- Single folder launch: created one native tab in the existing Explorer HWND; no extra Explorer window remained.
-- Concurrent launch stress: `Beta`, `Gamma`, and `Delta` launched together and arrived once each in the same Explorer window.
-- Browse-race check: the original tab was independently navigated to `C:\Windows` while those three requests were processing; it stayed at `C:\Windows` and none of the requested paths crossed.
-- `Win+E`: native tab count increased by one while Explorer top-level window count stayed unchanged.
-- Shift bypass: the next folder launch remained in a genuinely separate Explorer HWND.
-- Published executable smoke test: the self-contained release started successfully without using the development runtime.
+All checks passed: five new-tab requests each added one native tab, twelve explicit folder requests arrived at the correct paths (including a literal `%20` folder name), three simultaneous opens arrived once each, the independently navigated original tab kept its location, and three external Explorer launches were transferred into the same window.
 
-The application also uses a fail-open path: if the native tab host or destination tab cannot be confirmed, the captured Explorer window is restored instead of discarded.
+| Operation | Observed time |
+| --- | --- |
+| New-tab broker completion, five requests | 125–578 ms |
+| New-tab test observer completion | 141–1,050 ms |
+| Explicit folder requests, twelve requests | median 640 ms; maximum 1,236 ms |
+| Three simultaneous folder requests | broker completions 1,375–1,563 ms; all verified by 1,876 ms |
+| External window capture to confirmed transfer | 1,281–1,984 ms |
+| External launch through verification, including Windows startup | 2,462–3,132 ms |
+
+The broker and observer measure different boundaries. Observer scheduling and COM verification add overhead; neither metric measures every pixel finishing rendering. Earlier exploratory runs found warm new-tab completions as low as 29–60 ms, but those are not advertised as guaranteed timings. The all-opens-under-one-second target is **not met** for external launches, cold starts, or bursts on this machine.
+
+## Recovery checks
+
+The fault harness deliberately blocks the broker for 5.5 seconds. The independent watchdog restores a captured source around its three-second deadline, and the late continuation leaves that restored window open. Pausing during capture also restores the source. These checks passed.
+
+Noninteractive regression checks cover path case/separators, literal percent names, virtual-folder aliases, the difference between `C:` and `C:\`, and diagnostic observers that throw while recovery is logging.
+
+## Reproduce
+
+```powershell
+dotnet run --project tests/PaneWeaver.Tests.csproj -c Release
+
+# Interactive desktop needed. Exit the resident PaneWeaver instance first.
+dotnet run --project tests/PaneWeaver.Tests.csproj -c Release -- --live
+dotnet run --project tests/PaneWeaver.Tests.csproj -c Release -- --faults
+```
+
+Live tests create uniquely named folders below `%TEMP%`, preserve unrelated Explorer windows, and close only windows containing their own fixture paths and blank/virtual tabs. Empty fixture directories are retained for inspection. `--cleanup-test-windows` cleans up abandoned test windows after an interrupted run, subject to the same ownership check.
+
+CI runs the noninteractive checks. Live Explorer timing and recovery checks require a signed-in desktop and are not claimed as CI coverage. Physical Win+E input was not injected: its shared router path was exercised directly. Network drives, third-party shell extensions, other Windows feature builds, process crashes, and every possible manual tab-drag interaction remain outside this test run.

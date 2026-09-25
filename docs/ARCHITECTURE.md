@@ -1,47 +1,39 @@
-# Architecture
+# PaneWeaver 1.1 architecture
 
-PaneWeaver is a Windows Forms notification-area process with two event hooks and one serialized STA transaction broker.
+PaneWeaver is an out-of-process Windows Forms tray utility. It does not inject code into Explorer, modify default folder associations, add a toolbar, or simulate address-bar input.
 
-## Components
+## Scheduling
 
-### Window event hook
+Window and keyboard hooks stay on the UI thread. Work is admitted to a bounded queue and dispatched to a background STA with a Windows message pump. Async continuations resume on this apartment. A semaphore covers native tab creation only; source discovery, registration waits, and navigation overlap. COM calls themselves remain synchronous and can block when Explorer is unresponsive.
 
-`SetWinEventHook` watches Explorer `CabinetWClass` creation and show events. Each HWND is claimed once. If another visible Explorer window exists, the new window receives a layered alpha value of zero and a DWM cloak while its Shell destination becomes available.
+## Exact destination selection
 
-This is an out-of-process accessibility hook; PaneWeaver does not inject a DLL into Explorer.
+Before issuing Explorer's internal `WM_COMMAND 0xA21B`, snapshot its `ShellTabWindowClass` child HWNDs. Deliver the command with a bounded `SendMessageTimeout`, then identify the new child. If multiple children appear, fail open rather than guess. Resolve that HWND through each candidate browser's `IServiceProvider -> IShellBrowser -> IOleWindow.GetWindow`. Never select a browser by collection index or by whichever tab is active.
 
-### Keyboard hook
+`IShellWindows` is cached on the broker apartment and reconnected after errors. Enumeration visits newest entries first, but their HWND—not position—decides identity. Reading the registration count avoids repeatedly scanning unchanged collections; periodic probes also cover a close and an open that leave the count unchanged. Filesystem navigation uses typed dispatch. Filesystem-path checks avoid loading virtual-folder automation during destination verification.
 
-A low-level keyboard hook recognizes `Win + E`. When Explorer already exists, the keystroke is consumed and PaneWeaver requests a native tab directly. Shift arms one bypass transaction so users can still request a separate window.
+Win+E, the tray action, and `NEWTAB` skip COM after the new native child exists. Their timing measures tab creation, not completion of the Home page's contents.
 
-### Shell COM enumeration
+## Captured windows
 
-`Shell.Application.Windows()` exposes `IWebBrowser2` entries for File Explorer tabs. PaneWeaver reads the captured window's location from `LocationURL`, with a Shell folder fallback for virtual locations.
+Existing Explorer windows are seeded into a handled set. CREATE and SHOW are deduplicated; DESTROY removes state immediately so HWND reuse is not permanently ignored. Captured windows are excluded from target selection even if they report `IsWindowVisible`.
 
-Before asking Explorer for a new tab, PaneWeaver records the global Shell window count. Explorer appends the new tab as another Shell COM entry, allowing the broker to address that exact entry even if the user changes the active tab.
+DWM cloaking is attempted first. If Windows refuses cross-process cloaking, a reversible layered-alpha fallback is used. Existing layered windows are left untouched. A separate timer watches the three-second capture budget independently of the COM apartment. Pause, exit, failures, and expiry restore captures. Original styles are preserved, and timeout and close decisions share a per-capture lock.
 
-### Native tab command
+After navigation, the broker reads back the destination, rechecks that the source still contains exactly one tab at the original location, and only then requests source closure. It retains watchdog ownership until destruction, so an ignored close cannot leave the source hidden forever.
 
-The Explorer descendant window class `ShellTabWindowClass` accepts the internal new-tab `WM_COMMAND` value `0xA21B` on currently supported Windows 11 builds. This command is not a documented public API and may require maintenance after Windows feature updates.
+## Boundaries
 
-### Transaction broker
+- Native tab creation is an undocumented Explorer command and may change with Windows updates.
+- Out-of-process capture cannot guarantee pre-paint interception or sub-second creation of a window owned by Windows.
+- The recovery deadline does not interrupt an in-flight COM call. The independent watchdog can restore the source while the broker is blocked; elapsed deadlines prevent later closure.
+- Overlapping user-created tabs or source changes cause conservative fallback. Rare timing ambiguity remains possible with undocumented tab internals; this is not proof of bug-free operation.
+- Folder location is preserved; selection, navigation history, custom view state, and arbitrary multi-tab window transfers are not implemented.
+- Hard process termination can prevent in-process recovery. Normal exit restores captures.
+- Explicit opens fall back to Explorer on uncertainty; a late response can leave an extra tab. No arbitrary tab is closed to hide uncertainty.
 
-All capture-to-tab operations execute on one background STA thread:
+## References
 
-1. Resolve the captured destination.
-2. Validate or replace the primary Explorer HWND.
-3. Snapshot the Shell COM count.
-4. create one native tab.
-5. Identify and navigate the appended COM entry.
-6. Close the hidden source window only after success.
-
-If any required step fails, the original extended style is restored, the DWM cloak is removed, and the normal Explorer window is shown.
-
-## Safety invariants
-
-- Never close a captured Explorer window before its destination exists in a confirmed tab.
-- Never navigate an arbitrary active tab.
-- Never use clipboard contents or simulated address-bar input.
-- Never require elevation.
-- Never replace the default Windows folder association.
-- Always restore a captured window on uncertainty.
+- [IShellWindows](https://learn.microsoft.com/en-us/windows/win32/api/exdisp/nn-exdisp-ishellwindows)
+- [COM identity rules](https://learn.microsoft.com/en-us/windows/win32/com/rules-for-implementing-queryinterface)
+- [Navigate behavior](https://learn.microsoft.com/en-us/previous-versions/aa752133(v=vs.85))

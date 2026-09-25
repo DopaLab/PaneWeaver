@@ -85,7 +85,7 @@ internal sealed class PaneWeaverContext : ApplicationContext
                     PipeDirection.In,
                     1,
                     PipeTransmissionMode.Byte,
-                    PipeOptions.Asynchronous);
+                    PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
                 await pipe.WaitForConnectionAsync(token);
                 using var reader = new StreamReader(pipe);
                 var command = await reader.ReadLineAsync(token);

@@ -8,6 +8,7 @@ internal static class NativeMethods
 {
     internal const uint EventSystemForeground = 0x0003;
     internal const uint EventObjectCreate = 0x8000;
+    internal const uint EventObjectDestroy = 0x8001;
     internal const uint EventObjectShow = 0x8002;
     internal const int ObjIdWindow = 0;
     internal const uint WineventOutOfContext = 0x0000;
@@ -135,9 +136,17 @@ internal static class NativeMethods
     [return: MarshalAs(UnmanagedType.Bool)]
     internal static extern bool PostMessage(IntPtr hwnd, uint message, IntPtr wParam, IntPtr lParam);
 
+    [DllImport("user32.dll", SetLastError = true)]
+    internal static extern IntPtr SendMessageTimeout(IntPtr hwnd, uint message, IntPtr wParam,
+        IntPtr lParam, uint flags, uint timeout, out UIntPtr result);
+
     [DllImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
     internal static extern bool ShowWindow(IntPtr hwnd, int command);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static extern bool ShowWindowAsync(IntPtr hwnd, int command);
 
     [DllImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
@@ -174,7 +183,8 @@ internal static class NativeMethods
         GetWindowThreadProcessId(hwnd, out var processId);
         try
         {
-            return string.Equals(Process.GetProcessById((int)processId).ProcessName, "explorer", StringComparison.OrdinalIgnoreCase);
+            using var process = Process.GetProcessById((int)processId);
+            return string.Equals(process.ProcessName, "explorer", StringComparison.OrdinalIgnoreCase);
         }
         catch
         {
@@ -196,6 +206,19 @@ internal static class NativeMethods
 
             result = child;
             return false;
+        }, IntPtr.Zero);
+        return result;
+    }
+
+    internal static HashSet<IntPtr> GetShellTabHosts(IntPtr explorerWindow)
+    {
+        var result = new HashSet<IntPtr>();
+        EnumChildWindows(explorerWindow, (child, _) =>
+        {
+            var name = new StringBuilder(64);
+            GetClassName(child, name, name.Capacity);
+            if (name.ToString() == "ShellTabWindowClass") result.Add(child);
+            return true;
         }, IntPtr.Zero);
         return result;
     }

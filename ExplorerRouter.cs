@@ -6,7 +6,17 @@ namespace PaneWeaver;
 internal sealed class ExplorerRouter : IDisposable
 {
     private readonly ActivityLog log;
-    private readonly BlockingCollection<Action> queue = new();
+    private readonly ConcurrentQueue<Func<Task>> queue = new();
+    private readonly SemaphoreSlim tabGate = new(1, 1);
+    private readonly CancellationTokenSource stopping = new();
+    private readonly ExplorerCom shell = new(); // Used exclusively on the pumped STA.
+    private readonly System.Threading.Timer watchdog;
+    private volatile Control? dispatcher;
+    private volatile int generation;
+    private int outstanding;
+    // This is a recovery deadline, not an advertised latency. Explorer owns
+    // rendering and cold/network startup; timing out at 850 ms lost valid opens.
+    internal const int TransactionBudgetMs = 3000;
     private readonly ConcurrentDictionary<IntPtr, HiddenWindow> hidden = new();
     private readonly ConcurrentDictionary<IntPtr, byte> handledWindows = new();
     private readonly Thread worker;
@@ -23,7 +33,7 @@ internal sealed class ExplorerRouter : IDisposable
     private volatile bool rightWinDown;
     private volatile bool shiftDown;
     private long shiftBypassUntil;
-    private bool disposed;
+    private volatile bool disposed;
 
     internal ExplorerRouter(ActivityLog log)
     {
@@ -38,6 +48,9 @@ internal sealed class ExplorerRouter : IDisposable
         };
         worker.SetApartmentState(ApartmentState.STA);
         worker.Start();
+        // Independent of the COM apartment: a stalled shell RPC cannot keep
+        // captured Explorer windows invisible indefinitely.
+        watchdog = new System.Threading.Timer(_ => RestoreExpired(), null, 50, 50);
     }
 
     internal bool Enabled
@@ -46,13 +59,25 @@ internal sealed class ExplorerRouter : IDisposable
         set
         {
             enabled = value;
+            if (!value)
+            {
+                Interlocked.Increment(ref generation);
+                foreach (var hwnd in hidden.Keys) Restore(hwnd);
+            }
             log.Write(value ? "Routing enabled" : "Routing paused");
         }
     }
 
-    internal void Start()
+    internal void Start(IntPtr preferredWindow = default)
     {
-        lastExplorerWindow = NativeMethods.GetForegroundWindow();
+        // Existing windows must never be mistaken for new launches on a later SHOW.
+        NativeMethods.EnumWindows((hwnd, _) =>
+        {
+            if (NativeMethods.IsExplorerWindow(hwnd)) handledWindows.TryAdd(hwnd, 0);
+            return true;
+        }, IntPtr.Zero);
+        lastExplorerWindow = NativeMethods.IsExplorerWindow(preferredWindow)
+            ? preferredWindow : NativeMethods.GetForegroundWindow();
         if (!NativeMethods.IsExplorerWindow(lastExplorerWindow))
         {
             lastExplorerWindow = FindPrimaryExplorer(IntPtr.Zero);
@@ -99,7 +124,17 @@ internal sealed class ExplorerRouter : IDisposable
             return;
         }
 
-        queue.Add(() => CreateNativeTab(primary, path, bringToFront: true));
+        var epoch = generation;
+        var started = Environment.TickCount64;
+        if (!Enqueue(async () =>
+        {
+            var result = await CreateNativeTab(primary, path, started, epoch, 5000);
+            log.Write($"Direct tab: {result}, {Environment.TickCount64 - started} ms");
+            // Preserve explicit destinations even if a dispatched tab cannot be
+            // confirmed. An occasional duplicate is safer than losing an open.
+            if ((result == TabResult.NotStarted || (result != TabResult.Confirmed && !string.IsNullOrWhiteSpace(path))) &&
+                enabled && epoch == generation) LaunchExplorer(path);
+        })) LaunchExplorer(path);
     }
 
     private void OnForegroundEvent(
@@ -111,7 +146,7 @@ internal sealed class ExplorerRouter : IDisposable
         uint eventThread,
         uint eventTime)
     {
-        if (NativeMethods.IsExplorerWindow(hwnd))
+        if (!hidden.ContainsKey(hwnd) && NativeMethods.IsExplorerWindow(hwnd))
         {
             lastExplorerWindow = hwnd;
         }
@@ -126,6 +161,12 @@ internal sealed class ExplorerRouter : IDisposable
         uint eventThread,
         uint eventTime)
     {
+        if (eventType == NativeMethods.EventObjectDestroy && objectId == NativeMethods.ObjIdWindow)
+        {
+            handledWindows.TryRemove(hwnd, out _);
+            hidden.TryRemove(hwnd, out _);
+            return;
+        }
         if (!enabled || objectId != NativeMethods.ObjIdWindow || hwnd == IntPtr.Zero || !NativeMethods.IsExplorerWindow(hwnd))
         {
             return;
@@ -164,15 +205,18 @@ internal sealed class ExplorerRouter : IDisposable
             return;
         }
 
-        hidden.TryAdd(hwnd, Cloak(hwnd));
+        var state = Cloak(hwnd);
+        if (state is null) return;
+        hidden.TryAdd(hwnd, state);
 
-        log.Write($"Captured Explorer window 0x{hwnd.ToInt64():X} before display");
-        queue.Add(() => RedirectWindow(hwnd, primary));
+        log.Write($"Captured Explorer window 0x{hwnd.ToInt64():X}");
+        var epoch = generation;
+        if (!Enqueue(() => RedirectWindow(hwnd, primary, state, epoch))) Restore(hwnd);
     }
 
     private IntPtr OnKeyboardEvent(int code, IntPtr wParam, IntPtr lParam)
     {
-        if (code < 0 || !enabled)
+        if (code < 0)
         {
             return NativeMethods.CallNextHookEx(keyboardHook, code, wParam, lParam);
         }
@@ -193,28 +237,25 @@ internal sealed class ExplorerRouter : IDisposable
         else if (key.VkCode is NativeMethods.VkShift or NativeMethods.VkLshift or NativeMethods.VkRshift)
         {
             shiftDown = isDown || (shiftDown && !isUp);
-            if (isUp)
-            {
-                // Explorer can defer a shell launch for several seconds. Arm one
-                // bypass transaction after Shift is released so the user's intent
-                // survives that delay; the first Explorer window consumes it.
-                Interlocked.Exchange(ref shiftBypassUntil, Environment.TickCount64 + 5000);
-            }
+            // Releasing Shift while typing must not disable routing for five seconds.
         }
 
-        if (key.VkCode == NativeMethods.VkE && isDown)
+        if (enabled && key.VkCode == NativeMethods.VkE && isDown)
         {
             var winDown = leftWinDown || rightWinDown ||
                           (NativeMethods.GetAsyncKeyState(NativeMethods.VkLwin) & 0x8000) != 0 ||
                           (NativeMethods.GetAsyncKeyState(NativeMethods.VkRwin) & 0x8000) != 0;
             var shiftDown = (NativeMethods.GetAsyncKeyState(NativeMethods.VkShift) & 0x8000) != 0;
+            if (winDown && shiftDown)
+                Interlocked.Exchange(ref shiftBypassUntil, Environment.TickCount64 + 1500);
             if (winDown && !shiftDown)
             {
+                if (suppressingE) return new IntPtr(1); // Ignore auto-repeat.
                 var primary = FindPrimaryExplorer(IntPtr.Zero);
                 if (primary != IntPtr.Zero)
                 {
                     suppressingE = true;
-                    queue.Add(() => CreateNativeTab(primary, null, bringToFront: true));
+                    OpenInTab();
                     log.Write("Win+E routed directly to a native tab");
                     return new IntPtr(1);
                 }
@@ -230,11 +271,13 @@ internal sealed class ExplorerRouter : IDisposable
         return NativeMethods.CallNextHookEx(keyboardHook, code, wParam, lParam);
     }
 
-    private void RedirectWindow(IntPtr newWindow, IntPtr primary)
+    private async Task RedirectWindow(IntPtr newWindow, IntPtr primary, HiddenWindow state, int epoch)
     {
         try
         {
-            var path = WaitForPath(newWindow, TimeSpan.FromSeconds(2));
+            var (source, path) = await WaitForPath(newWindow, state.Started, epoch);
+            using var sourceLease = source;
+            log.Write($"Source resolved after {Environment.TickCount64 - state.Started} ms");
             if (!NativeMethods.IsWindow(newWindow))
             {
                 hidden.TryRemove(newWindow, out _);
@@ -253,17 +296,36 @@ internal sealed class ExplorerRouter : IDisposable
                 primary = FindPrimaryExplorer(newWindow);
             }
 
-            if (primary == IntPtr.Zero || !CreateNativeTab(primary, path, bringToFront: true))
+            if (!IsActive(state.Started, epoch) || !hidden.ContainsKey(newWindow)) return;
+            if (primary == IntPtr.Zero || await CreateNativeTab(primary, path, state.Started, epoch) != TabResult.Confirmed)
             {
                 log.Write($"Tab transaction failed safely; restoring window for {path}");
                 Restore(newWindow);
                 return;
             }
 
-            NativeMethods.PostMessage(newWindow, NativeMethods.WmClose, IntPtr.Zero, IntPtr.Zero);
-            hidden.TryRemove(newWindow, out _);
-            lastExplorerWindow = primary;
-            log.Write($"Docked {path}");
+            if (source is null || !SameLocation(source.Path, path) ||
+                NativeMethods.GetShellTabHosts(newWindow).Count != 1)
+            {
+                log.Write("Source changed during routing; leaving it open");
+                Restore(newWindow);
+                return;
+            }
+
+            lock (state)
+            {
+                // Timeout/pause can win while an RPC is in flight. Never close a
+                // source window that has already been returned to the user.
+                if (!IsActive(state.Started, epoch) || !hidden.ContainsKey(newWindow)) return;
+                if (!NativeMethods.PostMessage(newWindow, NativeMethods.WmClose, IntPtr.Zero, IntPtr.Zero))
+                {
+                    Restore(newWindow);
+                    return;
+                }
+                // Keep watchdog ownership until DESTROY, in case WM_CLOSE is ignored.
+                lastExplorerWindow = primary;
+                log.Write($"Docked in {Environment.TickCount64 - state.Started} ms: {path}");
+            }
         }
         catch (Exception exception)
         {
@@ -272,112 +334,138 @@ internal sealed class ExplorerRouter : IDisposable
         }
     }
 
-    private bool CreateNativeTab(IntPtr primary, string? path, bool bringToFront)
+    private async Task<TabResult> CreateNativeTab(IntPtr primary, string? path, long started, int epoch, int budget = TransactionBudgetMs)
     {
-        if (!NativeMethods.IsExplorerWindow(primary))
-        {
-            return false;
-        }
-
-        var host = NativeMethods.FindShellTabHost(primary);
-        if (host == IntPtr.Zero)
-        {
-            log.Write("Explorer tab host was not found");
-            return false;
-        }
-
-        var globalCountBefore = ExplorerCom.Count();
-
-        if (!NativeMethods.PostMessage(host, NativeMethods.WmCommand, new IntPtr(NativeMethods.CmdNewTab), IntPtr.Zero))
-        {
-            return false;
-        }
-
+        var sent = false;
+        var held = false;
         ExplorerEntry? created = null;
-        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(2);
-        while (DateTime.UtcNow < deadline && created is null)
+        try
         {
-            Thread.Sleep(20);
-            var entries = ExplorerCom.Enumerate(primary);
-            foreach (var entry in entries)
-            {
-                if (created is null && entry.GlobalIndex >= globalCountBefore)
-                {
-                    created = entry;
-                }
-                else
-                {
-                    entry.Dispose();
-                }
-            }
-        }
-
-        if (created is null)
-        {
-            log.Write("Explorer did not register the new tab in time");
-            return false;
-        }
-
-        using (created)
-        {
-            if (!string.IsNullOrWhiteSpace(path) && !created.Navigate(NormalizeForNavigation(path)))
-            {
-                created.Quit();
-                log.Write($"Explorer rejected tab navigation to {path}");
-                return false;
-            }
-        }
-
-        if (bringToFront)
-        {
-            if (NativeMethods.IsIconic(primary))
-            {
-                NativeMethods.ShowWindow(primary, NativeMethods.SwRestore);
-            }
-
+            var remaining = budget - (int)(Environment.TickCount64 - started);
+            if (remaining <= 0 || !await tabGate.WaitAsync(remaining, stopping.Token)) return TabResult.NotStarted;
+            held = true;
+            if (!IsActive(started, epoch, budget) || !NativeMethods.IsExplorerWindow(primary)) return TabResult.NotStarted;
+            var host = NativeMethods.FindShellTabHost(primary);
+            if (host == IntPtr.Zero) return TabResult.NotStarted;
+            // Native child-window snapshots avoid an O(all tabs) COM scan before
+            // every command. Resolve the new child back to its exact browser via
+            // IShellBrowser/IOleWindow before navigation.
+            var before = NativeMethods.GetShellTabHosts(primary);
+            if (before.Count == 0 || !IsActive(started, epoch, budget)) return TabResult.NotStarted;
+            var registrationCount = string.IsNullOrWhiteSpace(path) ? -1 : shell.Count;
+            // Deliver the command on Explorer's UI thread before claiming a
+            // child. A queued PostMessage could mistake a user's earlier Ctrl+T
+            // for our own tab. Timeout is uncertain, so never retry it blindly.
+            sent = true;
+            if (NativeMethods.SendMessageTimeout(host, NativeMethods.WmCommand,
+                new IntPtr(NativeMethods.CmdNewTab), IntPtr.Zero, 0x22, 1000, out _) == IntPtr.Zero)
+                return TabResult.Unconfirmed;
+            if (NativeMethods.IsIconic(primary)) NativeMethods.ShowWindow(primary, NativeMethods.SwRestore);
             NativeMethods.SetForegroundWindow(primary);
-        }
 
-        return true;
+            IntPtr newTab = IntPtr.Zero;
+            while (IsActive(started, epoch, budget) && newTab == IntPtr.Zero)
+            {
+                var candidates = NativeMethods.GetShellTabHosts(primary).Except(before).ToArray();
+                if (candidates.Length > 1)
+                {
+                    log.Write("Concurrent tab creation is ambiguous; preserving the source window");
+                    return TabResult.Unconfirmed;
+                }
+                if (candidates.Length == 1) newTab = candidates[0];
+                else await Task.Delay(10, stopping.Token);
+            }
+            // Once claimed, other requests may create tabs while this exact tab
+            // navigates. A slow network folder doesn't serialize every request.
+            tabGate.Release();
+            held = false;
+            if (newTab != IntPtr.Zero && string.IsNullOrWhiteSpace(path) && IsActive(started, epoch, budget))
+                return TabResult.Confirmed; // Win+E requires no COM lookup or navigation.
+            var nextProbe = Environment.TickCount64 + 120;
+            while (newTab != IntPtr.Zero && NativeMethods.IsWindow(newTab) && IsActive(started, epoch, budget) && created is null)
+            {
+                var count = shell.Count;
+                if (count != registrationCount || Environment.TickCount64 >= nextProbe)
+                {
+                    created = shell.Enumerate(primary, newTab, firstOnly: true).FirstOrDefault();
+                    registrationCount = count;
+                    nextProbe = Environment.TickCount64 + 120;
+                }
+                if (created is null) await Task.Delay(10, stopping.Token);
+            }
+            if (created is null || !IsActive(started, epoch, budget)) return TabResult.Unconfirmed;
+            log.Write($"Tab registered after {Environment.TickCount64 - started} ms");
+            if (string.IsNullOrWhiteSpace(path)) return TabResult.Confirmed;
+            if (!created.Navigate(NormalizeForNavigation(path))) return TabResult.Unconfirmed;
+            // Navigate2 is asynchronous: success means accepted, not arrived.
+            while (IsActive(started, epoch, budget))
+            {
+                var actual = path.StartsWith("shell:", StringComparison.OrdinalIgnoreCase) || path.StartsWith("::{")
+                    ? created.Path : created.FileSystemPath;
+                if (SameLocation(actual, path)) return TabResult.Confirmed;
+                await Task.Delay(10, stopping.Token);
+            }
+            return TabResult.Unconfirmed;
+        }
+        catch (OperationCanceledException) { return sent ? TabResult.Unconfirmed : TabResult.NotStarted; }
+        finally
+        {
+            created?.Dispose();
+            if (held) tabGate.Release();
+        }
     }
 
-    private static string WaitForPath(IntPtr hwnd, TimeSpan timeout)
+    private async Task<(ExplorerEntry? Source, string Path)> WaitForPath(IntPtr hwnd, long started, int epoch)
     {
-        var deadline = DateTime.UtcNow + timeout;
-        while (DateTime.UtcNow < deadline && NativeMethods.IsWindow(hwnd))
+        var registrationCount = -1;
+        var nextProbe = 0L;
+        while (IsActive(started, epoch) && NativeMethods.IsWindow(hwnd))
         {
-            Thread.Sleep(20);
-            var entries = ExplorerCom.Enumerate(hwnd);
+            var count = shell.Count;
+            if (count == registrationCount && Environment.TickCount64 < nextProbe)
+            {
+                await Task.Delay(10, stopping.Token);
+                continue;
+            }
+            registrationCount = count;
+            nextProbe = Environment.TickCount64 + 120;
+            var entries = shell.Enumerate(hwnd, firstOnly: true);
+            ExplorerEntry? selected = null;
             try
             {
-                var path = entries.Select(entry => entry.Path).FirstOrDefault(value => !string.IsNullOrWhiteSpace(value));
-                if (!string.IsNullOrWhiteSpace(path))
+                if (entries.Count != 0)
                 {
-                    return path;
+                    var path = entries[0].Path;
+                    if (!string.IsNullOrWhiteSpace(path))
+                    {
+                        selected = entries[0];
+                        return (selected, path);
+                    }
                 }
             }
             finally
             {
                 foreach (var entry in entries)
                 {
-                    entry.Dispose();
+                    if (!ReferenceEquals(entry, selected)) entry.Dispose();
                 }
             }
+            await Task.Delay(10, stopping.Token);
         }
 
-        return string.Empty;
+        return (null, string.Empty);
     }
 
     private IntPtr FindPrimaryExplorer(IntPtr exclude)
     {
         var remembered = lastExplorerWindow;
-        if (remembered != exclude && NativeMethods.IsExplorerWindow(remembered) && NativeMethods.IsWindowVisible(remembered))
+        if (remembered != exclude && !hidden.ContainsKey(remembered) && NativeMethods.IsExplorerWindow(remembered) && NativeMethods.IsWindowVisible(remembered))
         {
             return remembered;
         }
 
         var foreground = NativeMethods.GetForegroundWindow();
-        if (foreground != exclude && NativeMethods.IsExplorerWindow(foreground) && NativeMethods.IsWindowVisible(foreground))
+        if (foreground != exclude && !hidden.ContainsKey(foreground) && NativeMethods.IsExplorerWindow(foreground) && NativeMethods.IsWindowVisible(foreground))
         {
             lastExplorerWindow = foreground;
             return foreground;
@@ -386,7 +474,7 @@ internal sealed class ExplorerRouter : IDisposable
         IntPtr found = IntPtr.Zero;
         NativeMethods.EnumWindows((window, _) =>
         {
-            if (window == exclude || !NativeMethods.IsWindowVisible(window) || !NativeMethods.IsExplorerWindow(window))
+            if (window == exclude || hidden.ContainsKey(window) || !NativeMethods.IsWindowVisible(window) || !NativeMethods.IsExplorerWindow(window))
             {
                 return true;
             }
@@ -402,39 +490,44 @@ internal sealed class ExplorerRouter : IDisposable
         return found;
     }
 
-    private HiddenWindow Cloak(IntPtr hwnd)
+    private HiddenWindow? Cloak(IntPtr hwnd)
     {
-        var originalStyle = NativeMethods.GetWindowLongPtr(hwnd, NativeMethods.GwlExStyle).ToInt64();
-        NativeMethods.SetWindowLongPtr(hwnd, NativeMethods.GwlExStyle, new IntPtr(originalStyle | NativeMethods.WsExLayered));
-        NativeMethods.SetLayeredWindowAttributes(hwnd, 0, 0, NativeMethods.LwaAlpha);
         var cloak = 1;
-        NativeMethods.DwmSetWindowAttribute(hwnd, NativeMethods.DwmwaCloak, ref cloak, sizeof(int));
-        return new HiddenWindow(originalStyle);
+        var started = Environment.TickCount64;
+        if (NativeMethods.DwmSetWindowAttribute(hwnd, NativeMethods.DwmwaCloak, ref cloak, sizeof(int)) == 0)
+            return new HiddenWindow(started, null);
+        // Windows may reject cross-process cloaking. Preserve the existing style
+        // and never take ownership of someone else's layered-window attributes.
+        var style = NativeMethods.GetWindowLongPtr(hwnd, NativeMethods.GwlExStyle).ToInt64();
+        if ((style & NativeMethods.WsExLayered) != 0) return null;
+        NativeMethods.SetWindowLongPtr(hwnd, NativeMethods.GwlExStyle, new IntPtr(style | NativeMethods.WsExLayered));
+        if (!NativeMethods.SetLayeredWindowAttributes(hwnd, 0, 0, NativeMethods.LwaAlpha))
+        {
+            NativeMethods.SetWindowLongPtr(hwnd, NativeMethods.GwlExStyle, new IntPtr(style));
+            return null;
+        }
+        return new HiddenWindow(started, style);
     }
 
     private void Restore(IntPtr hwnd)
     {
-        if (!hidden.TryRemove(hwnd, out var state) || !NativeMethods.IsWindow(hwnd))
+        if (!hidden.TryGetValue(hwnd, out var state))
         {
             return;
         }
 
-        var cloak = 0;
-        NativeMethods.DwmSetWindowAttribute(hwnd, NativeMethods.DwmwaCloak, ref cloak, sizeof(int));
-        NativeMethods.SetWindowLongPtr(hwnd, NativeMethods.GwlExStyle, new IntPtr(state.OriginalExStyle));
-        NativeMethods.SetWindowPos(
-            hwnd,
-            IntPtr.Zero,
-            0,
-            0,
-            0,
-            0,
-            NativeMethods.SwpNoMove |
-            NativeMethods.SwpNoSize |
-            NativeMethods.SwpNoZOrder |
-            NativeMethods.SwpNoActivate |
-            NativeMethods.SwpFrameChanged);
-        NativeMethods.ShowWindow(hwnd, NativeMethods.SwRestore);
+        lock (state)
+        {
+            if (!hidden.TryRemove(hwnd, out _) || !NativeMethods.IsWindow(hwnd)) return;
+            var cloak = 0;
+            NativeMethods.DwmSetWindowAttribute(hwnd, NativeMethods.DwmwaCloak, ref cloak, sizeof(int));
+            if (state.OriginalStyle is long style)
+            {
+                NativeMethods.SetLayeredWindowAttributes(hwnd, 0, 255, NativeMethods.LwaAlpha);
+                NativeMethods.SetWindowLongPtr(hwnd, NativeMethods.GwlExStyle, new IntPtr(style));
+            }
+            NativeMethods.ShowWindowAsync(hwnd, NativeMethods.SwRestore);
+        }
     }
 
     private static bool IsRedirectable(string path)
@@ -470,18 +563,69 @@ internal sealed class ExplorerRouter : IDisposable
 
     private void WorkerMain()
     {
-        foreach (var action in queue.GetConsumingEnumerable())
+        // COM events and async continuations need a real STA message pump.
+        using var control = new Control();
+        _ = control.Handle;
+        SynchronizationContext.SetSynchronizationContext(new WindowsFormsSynchronizationContext());
+        dispatcher = control;
+        shell.WarmUp();
+        Drain();
+        if (!stopping.IsCancellationRequested) Application.Run();
+        shell.Dispose();
+    }
+
+    private bool Enqueue(Func<Task> action)
+    {
+        if (disposed) return false;
+        if (Interlocked.Increment(ref outstanding) > 64)
         {
-            try
-            {
-                action();
-            }
-            catch (Exception exception)
-            {
-                log.Write($"Transaction error: {exception.Message}");
-            }
+            Interlocked.Decrement(ref outstanding);
+            return false;
+        }
+        queue.Enqueue(action);
+        try { dispatcher?.BeginInvoke(Drain); }
+        catch (InvalidOperationException) { return false; }
+        return true;
+    }
+
+    private void Drain()
+    {
+        while (queue.TryDequeue(out var action)) _ = Run(action);
+    }
+
+    private async Task Run(Func<Task> action)
+    {
+        try { if (!stopping.IsCancellationRequested) await action(); }
+        catch (Exception exception) { log.Write($"Transaction error: {exception.Message}"); }
+        finally { Interlocked.Decrement(ref outstanding); }
+    }
+
+    private bool IsActive(long started, int epoch, int budget = TransactionBudgetMs) => enabled && !stopping.IsCancellationRequested &&
+        generation == epoch && Environment.TickCount64 - started < budget;
+
+    private void RestoreExpired()
+    {
+        foreach (var pair in hidden)
+        {
+            if (Environment.TickCount64 - pair.Value.Started < TransactionBudgetMs) continue;
+            Restore(pair.Key);
+            log.Write("Watchdog released an expired capture");
         }
     }
+
+    internal static bool SameLocation(string actual, string expected) =>
+        CanonicalLocation(actual).Equals(CanonicalLocation(expected), StringComparison.OrdinalIgnoreCase);
+
+    private static string CanonicalLocation(string path)
+    {
+        var normalized = NormalizeForNavigation(path);
+        var trimmed = normalized.TrimEnd('\\', '/');
+        // C: is drive-relative; C:\ is the drive root. Do not equate them.
+        return trimmed.Length == 2 && trimmed[1] == ':' && trimmed.Length != normalized.Length
+            ? trimmed + "\\" : trimmed;
+    }
+
+    private enum TabResult { NotStarted, Unconfirmed, Confirmed }
 
     public void Dispose()
     {
@@ -492,6 +636,8 @@ internal sealed class ExplorerRouter : IDisposable
 
         disposed = true;
         enabled = false;
+        stopping.Cancel();
+        watchdog.Dispose();
         if (windowEventHook != IntPtr.Zero)
         {
             NativeMethods.UnhookWinEvent(windowEventHook);
@@ -512,9 +658,10 @@ internal sealed class ExplorerRouter : IDisposable
             Restore(hwnd);
         }
 
-        queue.CompleteAdding();
-        worker.Join(TimeSpan.FromSeconds(2));
+        try { dispatcher?.BeginInvoke(() => Application.ExitThread()); }
+        catch (InvalidOperationException) { }
+        worker.Join(TimeSpan.FromMilliseconds(100));
     }
 
-    private sealed record HiddenWindow(long OriginalExStyle);
+    private sealed record HiddenWindow(long Started, long? OriginalStyle);
 }

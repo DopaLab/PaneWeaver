@@ -19,7 +19,16 @@ internal sealed class ActivityLog
             }
         }
 
-        Added?.Invoke(line);
+        // A closing log window or diagnostic observer must never interrupt
+        // recovery, hook processing, or a tab transaction.
+        if (Added is { } listeners)
+        {
+            foreach (Action<string> listener in listeners.GetInvocationList())
+            {
+                try { listener(line); }
+                catch { /* Logging is observational, not part of the transaction. */ }
+            }
+        }
     }
 
     internal string Snapshot()
